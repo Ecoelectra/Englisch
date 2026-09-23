@@ -9,10 +9,10 @@
     "build": "vite build",
     "preview": "vite preview --host"
   },
-  "dependencies": {
-    "@anthropic-ai/sdk": "0.128.0"
-  },
   "devDependencies": {
     "vite": "^8.0.0"
+  },
+  "dependencies": {
+    "@google/genai": "^2.24.0"
   }
 }

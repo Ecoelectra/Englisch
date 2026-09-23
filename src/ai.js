@@ -1,8 +1,8 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { ApiError, GoogleGenAI } from "@google/genai";
 
-const MODEL = "claude-opus-5";
-// Server-side fallback: if the model declines a request, Anthropic re-runs it on a fallback model.
-const FALLBACK = { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" };
+// Models with a free tier in the Gemini API, tried in this order. Free quotas are counted per model,
+// so when one model's quota is used up (or a model no longer exists) the next one takes over.
+const MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"];
 
 export const LEVELS = {
   A2: { label: "Einsteiger", hint: "A2 · einfache Sätze, langsam" },
@@ -12,8 +12,22 @@ export const LEVELS = {
 };
 
 function client(apiKey) {
-  // The key stays on this device and is sent only to the Anthropic API.
-  return new Anthropic({ apiKey, dangerouslyAllowBrowser: true, maxRetries: 2 });
+  // The key stays on this device and is sent only to the Gemini API.
+  return new GoogleGenAI({ apiKey });
+}
+
+async function withModels(run, canRetry = () => true) {
+  let lastError;
+  for (const model of MODELS) {
+    try {
+      return await run(model);
+    } catch (err) {
+      lastError = err;
+      const next = err instanceof ApiError && (err.status === 404 || err.status === 429);
+      if (!next || !canRetry()) throw err;
+    }
+  }
+  throw lastError;
 }
 
 function conversationSystem(topic, level, name) {
@@ -38,65 +52,65 @@ export const OPENING =
   "(The learner just opened the app and chose this topic. Greet them briefly and open the conversation with an easy first question.)";
 
 const visible = (history) => history.filter((m) => !m.hidden);
-const apiMessages = (history) => history.map(({ role, content }) => ({ role, content }));
+const toContents = (history) =>
+  history.map(({ role, content }) => ({ role: role === "assistant" ? "model" : "user", parts: [{ text: content }] }));
+
+function parseJson(text) {
+  if (!text) throw new Error("Die KI hat keine Antwort geschickt. Bitte versuch es nochmal.");
+  return JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, ""));
+}
 
 /**
  * Streams the next assistant reply.
  * history: [{ role: "user" | "assistant", content: string, hidden?: true }] – kept only in memory.
  */
 export async function streamReply({ apiKey, topic, level, name, history, onText, signal }) {
-  const messages = apiMessages(history);
-  const stream = client(apiKey).beta.messages.stream(
-    {
-      model: MODEL,
-      max_tokens: 2000,
-      system: conversationSystem(topic, level, name),
-      cache_control: { type: "ephemeral" },
-      output_config: { effort: "low" },
-      messages,
-      ...FALLBACK,
+  const ai = client(apiKey);
+  let received = false;
+  return withModels(
+    async (model) => {
+      const stream = await ai.models.generateContentStream({
+        model,
+        contents: toContents(history),
+        config: { systemInstruction: conversationSystem(topic, level, name), abortSignal: signal },
+      });
+      let text = "";
+      for await (const chunk of stream) {
+        const delta = chunk.text;
+        if (!delta) continue;
+        received = true;
+        text += delta;
+        onText?.(delta);
+      }
+      if (!text.trim()) throw new Error("Die KI hat keine Antwort geschickt. Versuch es bitte anders zu formulieren.");
+      return text.trim();
     },
-    { signal },
+    // Only switch models if nothing has been shown yet.
+    () => !received,
   );
-  stream.on("text", (delta) => onText?.(delta));
-  const message = await stream.finalMessage();
-  if (message.stop_reason === "refusal") {
-    throw new Error("Die KI konnte darauf nicht antworten. Versuch es bitte anders zu formulieren.");
-  }
-  return message.content
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("")
-    .trim();
 }
 
 export async function suggestIdeas({ apiKey, topic, level, history }) {
   const transcript = visible(history)
     .map((m) => `${m.role === "user" ? "Learner" : "Partner"}: ${m.content}`)
     .join("\n");
-  const response = await client(apiKey).beta.messages.create({
-    model: MODEL,
-    max_tokens: 1000,
-    output_config: {
-      effort: "low",
-      format: {
-        type: "json_schema",
-        schema: {
+  const ai = client(apiKey);
+  const response = await withModels((model) =>
+    ai.models.generateContent({
+      model,
+      contents: `Conversation so far:\n${transcript || "(nothing yet)"}`,
+      config: {
+        systemInstruction: `You help a German learner of English (level ${level}) who is stuck in a conversation about "${topic}". Suggest exactly 3 short, natural sentences the learner could say next, at their level. Vary them: one simple answer, one with an opinion, one question back.`,
+        responseMimeType: "application/json",
+        responseJsonSchema: {
           type: "object",
-          properties: {
-            ideas: { type: "array", items: { type: "string" } },
-          },
+          properties: { ideas: { type: "array", items: { type: "string" } } },
           required: ["ideas"],
-          additionalProperties: false,
         },
       },
-    },
-    system: `You help a German learner of English (level ${level}) who is stuck in a conversation about "${topic}". Suggest exactly 3 short, natural sentences the learner could say next, at their level. Vary them: one simple answer, one with an opinion, one question back.`,
-    messages: [{ role: "user", content: `Conversation so far:\n${transcript || "(nothing yet)"}` }],
-    ...FALLBACK,
-  });
-  const text = response.content.find((b) => b.type === "text")?.text ?? "{}";
-  return JSON.parse(text).ideas ?? [];
+    }),
+  );
+  return parseJson(response.text).ideas ?? [];
 }
 
 const EVAL_SCHEMA = {
@@ -120,7 +134,6 @@ const EVAL_SCHEMA = {
           explanation: { type: "string" },
         },
         required: ["original", "better", "explanation"],
-        additionalProperties: false,
       },
     },
     vocabulary_tips: {
@@ -129,7 +142,6 @@ const EVAL_SCHEMA = {
         type: "object",
         properties: { phrase: { type: "string" }, meaning: { type: "string" } },
         required: ["phrase", "meaning"],
-        additionalProperties: false,
       },
     },
     next_goal: { type: "string" },
@@ -147,18 +159,14 @@ const EVAL_SCHEMA = {
     "vocabulary_tips",
     "next_goal",
   ],
-  additionalProperties: false,
 };
 
 export async function evaluate({ apiKey, topic, level, history, spokenTurns }) {
   const transcript = visible(history)
     .map((m) => `${m.role === "user" ? "LEARNER" : "PARTNER"}: ${m.content}`)
     .join("\n");
-  const stream = client(apiKey).beta.messages.stream({
-    model: MODEL,
-    max_tokens: 16000,
-    output_config: { effort: "high", format: { type: "json_schema", schema: EVAL_SCHEMA } },
-    system: `You are an experienced, fair and encouraging English examiner (Cambridge/IELTS speaking style) giving feedback to a German native speaker.
+  const ai = client(apiKey);
+  const systemInstruction = `You are an experienced, fair and encouraging English examiner (Cambridge/IELTS speaking style) giving feedback to a German native speaker.
 Evaluate ONLY the LEARNER's turns of the conversation below. The PARTNER is an AI and is not assessed.
 
 Context:
@@ -177,28 +185,42 @@ Feedback – write ALL feedback text in German (du-Form), warm and motivating, b
 - strengths: 2-4 concrete things done well.
 - improvements: up to 5 of the most useful corrections, each quoting the learner's original wording (English), a better native-like version (English) and a short German explanation. Prioritise repeated or typical German-speaker errors. Empty list only if there is really nothing to improve.
 - vocabulary_tips: 3-5 useful English words or phrases for this topic with German meaning.
-- next_goal: one concrete, achievable focus for the next session.`,
-    messages: [{ role: "user", content: `Conversation transcript:\n\n${transcript}` }],
-    ...FALLBACK,
-  });
-  const message = await stream.finalMessage();
-  if (message.stop_reason === "refusal") throw new Error("Die Auswertung wurde abgelehnt. Bitte versuch es erneut.");
-  const text = message.content.find((b) => b.type === "text")?.text;
-  if (!text) throw new Error("Keine Auswertung erhalten.");
-  const data = JSON.parse(text);
+- next_goal: one concrete, achievable focus for the next session.`;
+  const response = await withModels((model) =>
+    ai.models.generateContent({
+      model,
+      contents: `Conversation transcript:\n\n${transcript}`,
+      config: { systemInstruction, responseMimeType: "application/json", responseJsonSchema: EVAL_SCHEMA },
+    }),
+  );
+  const data = parseJson(response.text);
   const clamp = (n) => Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
   for (const k of ["overall", "grammar", "vocabulary", "fluency", "coherence"]) data[k] = clamp(data[k]);
+  if (!["A1", "A2", "B1", "B2", "C1", "C2"].includes(data.cefr)) data.cefr = cefrFromScore(data.overall);
+  for (const k of ["strengths", "improvements", "vocabulary_tips"]) if (!Array.isArray(data[k])) data[k] = [];
   return data;
 }
 
+function cefrFromScore(score) {
+  if (score > 90) return "C2";
+  if (score > 75) return "C1";
+  if (score > 60) return "B2";
+  if (score > 40) return "B1";
+  if (score > 20) return "A2";
+  return "A1";
+}
+
 export function friendlyError(err) {
-  if (err instanceof Anthropic.AuthenticationError) return "Der API-Schlüssel ist ungültig. Bitte prüfe ihn in den Einstellungen.";
-  if (err instanceof Anthropic.PermissionDeniedError) return "Dein API-Schlüssel hat keinen Zugriff auf dieses Modell.";
-  if (err instanceof Anthropic.RateLimitError) return "Kurz zu viele Anfragen – warte einen Moment und versuch es nochmal.";
-  if (err instanceof Anthropic.BadRequestError && /credit|billing|balance/i.test(err.message))
-    return "Dein Anthropic-Guthaben ist aufgebraucht. Lade es in der Anthropic Console auf.";
-  if (err instanceof Anthropic.APIConnectionError) return "Keine Verbindung zur KI. Bist du online?";
-  if (err instanceof Anthropic.APIUserAbortError) return "Abgebrochen.";
-  if (err instanceof Anthropic.APIError) return `Die KI meldet einen Fehler (${err.status ?? "?"}). Bitte versuch es erneut.`;
+  if (err?.name === "AbortError") return "Abgebrochen.";
+  if (err instanceof ApiError) {
+    if (err.status === 400 && /api.?key/i.test(err.message)) return "Der API-Schlüssel ist ungültig. Bitte prüfe ihn in den Einstellungen.";
+    if (err.status === 401 || err.status === 403) return "Dein API-Schlüssel darf die Gemini-API nicht nutzen. Prüfe ihn in Google AI Studio.";
+    if (err.status === 429)
+      return "Das kostenlose Kontingent ist gerade ausgeschöpft. Warte eine Minute und versuch es nochmal. Ist das Tageslimit erreicht, geht es morgen weiter.";
+    if (err.status >= 500) return "Die KI ist gerade überlastet. Bitte versuch es gleich nochmal.";
+    return `Die KI meldet einen Fehler (${err.status}). Bitte versuch es erneut.`;
+  }
+  if (err instanceof TypeError) return "Keine Verbindung zur KI. Bist du online?";
+  if (err instanceof SyntaxError) return "Die Antwort der KI war unvollständig. Bitte versuch es nochmal.";
   return err?.message || "Unbekannter Fehler.";
 }

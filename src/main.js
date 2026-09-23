@@ -164,11 +164,11 @@ function welcomeView() {
     </div>
     <section class="card setup">
       <h2>Einmalig einrichten</h2>
-      <p>Die App nutzt die KI <b>Claude</b> von Anthropic. Dafür brauchst du einen eigenen API-Schlüssel:</p>
+      <p>Die App nutzt die KI <b>Gemini</b> von Google – <b>kostenlos</b>, ohne Kreditkarte. Du brauchst nur einen eigenen Schlüssel:</p>
       <ol class="steps">
-        <li>Öffne <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a> und melde dich an.</li>
-        <li>Lade unter <i>Billing</i> etwas Guthaben auf (ein 10-Minuten-Gespräch kostet grob 20–40 Cent).</li>
-        <li>Erstelle unter <i>API Keys</i> einen Schlüssel und füge ihn hier ein.</li>
+        <li>Öffne <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> und melde dich mit deinem Google-Konto an.</li>
+        <li>Tippe auf <i>API-Schlüssel erstellen</i> (Create API key).</li>
+        <li>Kopiere den Schlüssel und füge ihn hier ein.</li>
       </ol>
       <label class="field">
         <span>Wie heißt du? <small>(optional)</small></span>
@@ -176,7 +176,7 @@ function welcomeView() {
       </label>
       <label class="field">
         <span>API-Schlüssel</span>
-        <input id="w-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sk-ant-…" />
+        <input id="w-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="AIza…" />
       </label>
       <button class="btn primary big" id="w-save">Los geht's 🚀</button>
       <p class="fineprint">Der Schlüssel bleibt nur auf diesem iPad gespeichert.</p>
@@ -512,9 +512,9 @@ function settingsView() {
 
     <section class="card">
       <h2>KI-Verbindung</h2>
-      <label class="field"><span>Anthropic API-Schlüssel</span>
-        <input id="s-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(settings.apiKey)}" placeholder="sk-ant-…" /></label>
-      <p class="fineprint">Den Schlüssel bekommst du auf <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>. Er wird nur auf diesem Gerät gespeichert.</p>
+      <label class="field"><span>Gemini API-Schlüssel</span>
+        <input id="s-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(settings.apiKey)}" placeholder="AIza…" /></label>
+      <p class="fineprint">Den kostenlosen Schlüssel bekommst du auf <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. Er wird nur auf diesem Gerät gespeichert. Die Gratis-Stufe hat ein Tageslimit an Anfragen – für mehrere Gespräche pro Tag reicht es normalerweise.</p>
     </section>
 
     <section class="card">
@@ -522,7 +522,7 @@ function settingsView() {
       <ul class="plain">
         <li><b>Gespräche werden nie gespeichert</b> – weder auf dem iPad noch in der App. Sie existieren nur im Arbeitsspeicher und werden nach der Auswertung (oder beim Abbrechen) verworfen.</li>
         <li>Gespeichert werden nur deine <b>Scores</b> (Datum, Thema, Punkte, Niveau) – lokal auf diesem Gerät.</li>
-        <li>Zum Antworten und Auswerten wird der Gesprächstext an die KI (Anthropic API) gesendet. Die Spracherkennung läuft über die Diktierfunktion von Apple.</li>
+        <li>Zum Antworten und Auswerten wird der Gesprächstext an die KI (Google Gemini API) gesendet. Für Nutzer in der EU nutzt Google diese Inhalte laut seinen Nutzungsbedingungen auch in der Gratis-Stufe nicht zur Verbesserung seiner Produkte. Die Spracherkennung läuft über die Diktierfunktion von Apple.</li>
       </ul>
     </section>
     <button class="btn primary big" id="s-save">Speichern</button>
@@ -552,7 +552,7 @@ function bindCommon() {
 function bindWelcome() {
   document.getElementById("w-save").addEventListener("click", () => {
     const key = document.getElementById("w-key").value.trim();
-    if (!key.startsWith("sk-")) return toast("Bitte füge einen gültigen API-Schlüssel ein (beginnt mit „sk-“).");
+    if (key.length < 20) return toast("Bitte füge deinen Gemini-API-Schlüssel ein (beginnt meist mit „AIza“).");
     settings = saveSettings({ apiKey: key, name: document.getElementById("w-name").value.trim() });
     go("home");
     toast("Alles bereit! Wähle ein Thema. 🎉");
