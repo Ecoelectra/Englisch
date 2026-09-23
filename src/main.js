@@ -164,11 +164,12 @@ function welcomeView() {
     </div>
     <section class="card setup">
       <h2>Einmalig einrichten</h2>
-      <p>Die App nutzt die KI <b>Gemini</b> von Google – <b>kostenlos</b>, ohne Kreditkarte. Du brauchst nur einen eigenen Schlüssel:</p>
+      <p>Die App nutzt die KI von <b>Mistral</b> (Frankreich) – <b>kostenlos</b>, ohne Kreditkarte. Du brauchst nur einen eigenen Schlüssel:</p>
       <ol class="steps">
-        <li>Öffne <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> und melde dich mit deinem Google-Konto an.</li>
-        <li>Tippe auf <i>API-Schlüssel erstellen</i> (Create API key).</li>
-        <li>Kopiere den Schlüssel und füge ihn hier ein.</li>
+        <li>Öffne <a href="https://console.mistral.ai" target="_blank" rel="noopener">console.mistral.ai</a> und erstelle ein kostenloses Konto.</li>
+        <li>Wähle den Gratis-Plan <i>Experiment</i> und bestätige deine Handynummer.</li>
+        <li>Erstelle unter <i>API Keys</i> einen Schlüssel, kopiere ihn und füge ihn hier ein.</li>
+        <li>Tipp: Schalte in den Datenschutz-Einstellungen (<i>Privacy</i>) von Mistral das Training mit deinen Daten aus.</li>
       </ol>
       <label class="field">
         <span>Wie heißt du? <small>(optional)</small></span>
@@ -176,7 +177,7 @@ function welcomeView() {
       </label>
       <label class="field">
         <span>API-Schlüssel</span>
-        <input id="w-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="AIza…" />
+        <input id="w-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Dein Mistral-Schlüssel" />
       </label>
       <button class="btn primary big" id="w-save">Los geht's 🚀</button>
       <p class="fineprint">Der Schlüssel bleibt nur auf diesem iPad gespeichert.</p>
@@ -512,9 +513,9 @@ function settingsView() {
 
     <section class="card">
       <h2>KI-Verbindung</h2>
-      <label class="field"><span>Gemini API-Schlüssel</span>
-        <input id="s-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(settings.apiKey)}" placeholder="AIza…" /></label>
-      <p class="fineprint">Den kostenlosen Schlüssel bekommst du auf <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. Er wird nur auf diesem Gerät gespeichert. Die Gratis-Stufe hat ein Tageslimit an Anfragen – für mehrere Gespräche pro Tag reicht es normalerweise.</p>
+      <label class="field"><span>Mistral API-Schlüssel</span>
+        <input id="s-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(settings.apiKey)}" placeholder="Dein Mistral-Schlüssel" /></label>
+      <p class="fineprint">Den kostenlosen Schlüssel bekommst du auf <a href="https://console.mistral.ai" target="_blank" rel="noopener">console.mistral.ai</a> (Plan „Experiment“). Er wird nur auf diesem Gerät gespeichert.</p>
     </section>
 
     <section class="card">
@@ -522,7 +523,7 @@ function settingsView() {
       <ul class="plain">
         <li><b>Gespräche werden nie gespeichert</b> – weder auf dem iPad noch in der App. Sie existieren nur im Arbeitsspeicher und werden nach der Auswertung (oder beim Abbrechen) verworfen.</li>
         <li>Gespeichert werden nur deine <b>Scores</b> (Datum, Thema, Punkte, Niveau) – lokal auf diesem Gerät.</li>
-        <li>Zum Antworten und Auswerten wird der Gesprächstext an die KI (Google Gemini API) gesendet. Für Nutzer in der EU nutzt Google diese Inhalte laut seinen Nutzungsbedingungen auch in der Gratis-Stufe nicht zur Verbesserung seiner Produkte. Die Spracherkennung läuft über die Diktierfunktion von Apple.</li>
+        <li>Zum Antworten und Auswerten wird der Gesprächstext an die KI von Mistral (Frankreich) gesendet. Im Gratis-Plan darf Mistral die Inhalte zum Trainieren nutzen – das kannst du in den Datenschutz-Einstellungen deines Mistral-Kontos ausschalten. Die Spracherkennung läuft über die Diktierfunktion von Apple.</li>
       </ul>
     </section>
     <button class="btn primary big" id="s-save">Speichern</button>
@@ -552,7 +553,7 @@ function bindCommon() {
 function bindWelcome() {
   document.getElementById("w-save").addEventListener("click", () => {
     const key = document.getElementById("w-key").value.trim();
-    if (key.length < 20) return toast("Bitte füge deinen Gemini-API-Schlüssel ein (beginnt meist mit „AIza“).");
+    if (key.length < 20) return toast("Bitte füge deinen Mistral-API-Schlüssel ein.");
     settings = saveSettings({ apiKey: key, name: document.getElementById("w-name").value.trim() });
     go("home");
     toast("Alles bereit! Wähle ein Thema. 🎉");

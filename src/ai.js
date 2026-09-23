@@ -1,8 +1,23 @@
-import { ApiError, GoogleGenAI } from "@google/genai";
+// Standalone functions: the lightweight, tree-shakeable API that Mistral recommends for browsers.
+import { MistralCore } from "@mistralai/mistralai/core.js";
+import { chatComplete } from "@mistralai/mistralai/funcs/chatComplete.js";
+import { chatStream } from "@mistralai/mistralai/funcs/chatStream.js";
+import { MistralError } from "@mistralai/mistralai/models/errors";
 
-// Models with a free tier in the Gemini API, tried in this order. Free quotas are counted per model,
-// so when one model's quota is used up (or a model no longer exists) the next one takes over.
-const MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"];
+// Fast model for the live conversation, stronger ones for the evaluation.
+// If a model is unavailable, the next one in the list takes over.
+const CHAT_MODELS = ["mistral-small-latest", "mistral-medium-latest"];
+const EVAL_MODELS = ["mistral-medium-latest", "mistral-large-latest", "mistral-small-latest"];
+
+// The free tier allows only a few requests per second – wait briefly and retry on 429 / 5xx.
+const RETRIES = {
+  retries: {
+    strategy: "backoff",
+    backoff: { initialInterval: 1200, maxInterval: 8000, exponent: 1.8, maxElapsedTime: 25000 },
+    retryConnectionErrors: false,
+  },
+  retryCodes: ["429", "5XX"],
+};
 
 export const LEVELS = {
   A2: { label: "Einsteiger", hint: "A2 · einfache Sätze, langsam" },
@@ -12,22 +27,35 @@ export const LEVELS = {
 };
 
 function client(apiKey) {
-  // The key stays on this device and is sent only to the Gemini API.
-  return new GoogleGenAI({ apiKey });
+  // The key stays on this device and is sent only to the Mistral API.
+  return new MistralCore({ apiKey });
 }
 
-async function withModels(run, canRetry = () => true) {
+// Standalone functions return { ok, value, error } instead of throwing.
+function unwrap(result) {
+  if (!result.ok) throw result.error;
+  return result.value;
+}
+
+async function withModels(models, run, canRetry = () => true) {
   let lastError;
-  for (const model of MODELS) {
+  for (const model of models) {
     try {
       return await run(model);
     } catch (err) {
       lastError = err;
-      const next = err instanceof ApiError && (err.status === 404 || err.status === 429);
+      const next = err instanceof MistralError && (err.statusCode === 404 || err.statusCode === 429);
       if (!next || !canRetry()) throw err;
     }
   }
   throw lastError;
+}
+
+// Message content is either a string or a list of chunks (text, thinking, …) – keep only the text.
+function textOf(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((c) => (c.type === "text" ? c.text : "")).join("");
+  return "";
 }
 
 function conversationSystem(topic, level, name) {
@@ -52,8 +80,10 @@ export const OPENING =
   "(The learner just opened the app and chose this topic. Greet them briefly and open the conversation with an easy first question.)";
 
 const visible = (history) => history.filter((m) => !m.hidden);
-const toContents = (history) =>
-  history.map(({ role, content }) => ({ role: role === "assistant" ? "model" : "user", parts: [{ text: content }] }));
+const toMessages = (system, history) => [
+  { role: "system", content: system },
+  ...history.map(({ role, content }) => ({ role, content })),
+];
 
 function parseJson(text) {
   if (!text) throw new Error("Die KI hat keine Antwort geschickt. Bitte versuch es nochmal.");
@@ -68,15 +98,18 @@ export async function streamReply({ apiKey, topic, level, name, history, onText,
   const ai = client(apiKey);
   let received = false;
   return withModels(
+    CHAT_MODELS,
     async (model) => {
-      const stream = await ai.models.generateContentStream({
-        model,
-        contents: toContents(history),
-        config: { systemInstruction: conversationSystem(topic, level, name), abortSignal: signal },
-      });
+      const stream = unwrap(
+        await chatStream(
+          ai,
+          { model, messages: toMessages(conversationSystem(topic, level, name), history) },
+          { ...RETRIES, signal },
+        ),
+      );
       let text = "";
-      for await (const chunk of stream) {
-        const delta = chunk.text;
+      for await (const event of stream) {
+        const delta = textOf(event.data?.choices[0]?.delta?.content);
         if (!delta) continue;
         received = true;
         text += delta;
@@ -94,23 +127,34 @@ export async function suggestIdeas({ apiKey, topic, level, history }) {
   const transcript = visible(history)
     .map((m) => `${m.role === "user" ? "Learner" : "Partner"}: ${m.content}`)
     .join("\n");
+  const system = `You help a German learner of English (level ${level}) who is stuck in a conversation about "${topic}". Suggest exactly 3 short, natural sentences the learner could say next, at their level. Vary them: one simple answer, one with an opinion, one question back.`;
   const ai = client(apiKey);
-  const response = await withModels((model) =>
-    ai.models.generateContent({
-      model,
-      contents: `Conversation so far:\n${transcript || "(nothing yet)"}`,
-      config: {
-        systemInstruction: `You help a German learner of English (level ${level}) who is stuck in a conversation about "${topic}". Suggest exactly 3 short, natural sentences the learner could say next, at their level. Vary them: one simple answer, one with an opinion, one question back.`,
-        responseMimeType: "application/json",
-        responseJsonSchema: {
-          type: "object",
-          properties: { ideas: { type: "array", items: { type: "string" } } },
-          required: ["ideas"],
+  const response = await withModels(CHAT_MODELS, async (model) =>
+    unwrap(
+      await chatComplete(
+        ai,
+        {
+          model,
+          messages: toMessages(system, [{ role: "user", content: `Conversation so far:\n${transcript || "(nothing yet)"}` }]),
+          responseFormat: {
+            type: "json_schema",
+            jsonSchema: {
+              name: "ideas",
+              strict: true,
+              schemaDefinition: {
+                type: "object",
+                properties: { ideas: { type: "array", items: { type: "string" } } },
+                required: ["ideas"],
+                additionalProperties: false,
+              },
+            },
+          },
         },
-      },
-    }),
+        RETRIES,
+      ),
+    ),
   );
-  return parseJson(response.text).ideas ?? [];
+  return parseJson(textOf(response.choices?.[0]?.message?.content)).ideas ?? [];
 }
 
 const EVAL_SCHEMA = {
@@ -134,6 +178,7 @@ const EVAL_SCHEMA = {
           explanation: { type: "string" },
         },
         required: ["original", "better", "explanation"],
+        additionalProperties: false,
       },
     },
     vocabulary_tips: {
@@ -142,6 +187,7 @@ const EVAL_SCHEMA = {
         type: "object",
         properties: { phrase: { type: "string" }, meaning: { type: "string" } },
         required: ["phrase", "meaning"],
+        additionalProperties: false,
       },
     },
     next_goal: { type: "string" },
@@ -159,6 +205,7 @@ const EVAL_SCHEMA = {
     "vocabulary_tips",
     "next_goal",
   ],
+  additionalProperties: false,
 };
 
 export async function evaluate({ apiKey, topic, level, history, spokenTurns }) {
@@ -166,7 +213,7 @@ export async function evaluate({ apiKey, topic, level, history, spokenTurns }) {
     .map((m) => `${m.role === "user" ? "LEARNER" : "PARTNER"}: ${m.content}`)
     .join("\n");
   const ai = client(apiKey);
-  const systemInstruction = `You are an experienced, fair and encouraging English examiner (Cambridge/IELTS speaking style) giving feedback to a German native speaker.
+  const system = `You are an experienced, fair and encouraging English examiner (Cambridge/IELTS speaking style) giving feedback to a German native speaker.
 Evaluate ONLY the LEARNER's turns of the conversation below. The PARTNER is an AI and is not assessed.
 
 Context:
@@ -186,14 +233,23 @@ Feedback – write ALL feedback text in German (du-Form), warm and motivating, b
 - improvements: up to 5 of the most useful corrections, each quoting the learner's original wording (English), a better native-like version (English) and a short German explanation. Prioritise repeated or typical German-speaker errors. Empty list only if there is really nothing to improve.
 - vocabulary_tips: 3-5 useful English words or phrases for this topic with German meaning.
 - next_goal: one concrete, achievable focus for the next session.`;
-  const response = await withModels((model) =>
-    ai.models.generateContent({
-      model,
-      contents: `Conversation transcript:\n\n${transcript}`,
-      config: { systemInstruction, responseMimeType: "application/json", responseJsonSchema: EVAL_SCHEMA },
-    }),
+  const response = await withModels(EVAL_MODELS, async (model) =>
+    unwrap(
+      await chatComplete(
+        ai,
+        {
+          model,
+          messages: toMessages(system, [{ role: "user", content: `Conversation transcript:\n\n${transcript}` }]),
+          responseFormat: {
+            type: "json_schema",
+            jsonSchema: { name: "evaluation", strict: true, schemaDefinition: EVAL_SCHEMA },
+          },
+        },
+        RETRIES,
+      ),
+    ),
   );
-  const data = parseJson(response.text);
+  const data = parseJson(textOf(response.choices?.[0]?.message?.content));
   const clamp = (n) => Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
   for (const k of ["overall", "grammar", "vocabulary", "fluency", "coherence"]) data[k] = clamp(data[k]);
   if (!["A1", "A2", "B1", "B2", "C1", "C2"].includes(data.cefr)) data.cefr = cefrFromScore(data.overall);
@@ -211,16 +267,16 @@ function cefrFromScore(score) {
 }
 
 export function friendlyError(err) {
-  if (err?.name === "AbortError") return "Abgebrochen.";
-  if (err instanceof ApiError) {
-    if (err.status === 400 && /api.?key/i.test(err.message)) return "Der API-Schlüssel ist ungültig. Bitte prüfe ihn in den Einstellungen.";
-    if (err.status === 401 || err.status === 403) return "Dein API-Schlüssel darf die Gemini-API nicht nutzen. Prüfe ihn in Google AI Studio.";
-    if (err.status === 429)
-      return "Das kostenlose Kontingent ist gerade ausgeschöpft. Warte eine Minute und versuch es nochmal. Ist das Tageslimit erreicht, geht es morgen weiter.";
-    if (err.status >= 500) return "Die KI ist gerade überlastet. Bitte versuch es gleich nochmal.";
-    return `Die KI meldet einen Fehler (${err.status}). Bitte versuch es erneut.`;
+  if (err?.name === "AbortError" || err?.name === "RequestAbortedError") return "Abgebrochen.";
+  if (err instanceof MistralError) {
+    if (err.statusCode === 401) return "Der API-Schlüssel ist ungültig. Bitte prüfe ihn in den Einstellungen.";
+    if (err.statusCode === 403) return "Dein API-Schlüssel darf dieses Modell nicht nutzen. Prüfe dein Konto bei Mistral.";
+    if (err.statusCode === 429)
+      return "Das kostenlose Kontingent ist gerade ausgeschöpft. Warte kurz und versuch es nochmal. Ist das Monatslimit erreicht, geht es im nächsten Monat weiter.";
+    if (err.statusCode >= 500) return "Die KI ist gerade überlastet. Bitte versuch es gleich nochmal.";
+    return `Die KI meldet einen Fehler (${err.statusCode}). Bitte versuch es erneut.`;
   }
-  if (err instanceof TypeError) return "Keine Verbindung zur KI. Bist du online?";
+  if (err?.name === "ConnectionError" || err instanceof TypeError) return "Keine Verbindung zur KI. Bist du online?";
   if (err instanceof SyntaxError) return "Die Antwort der KI war unvollständig. Bitte versuch es nochmal.";
   return err?.message || "Unbekannter Fehler.";
 }
