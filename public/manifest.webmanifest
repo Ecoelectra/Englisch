@@ -1,0 +1,17 @@
+{
+  "name": "SpeakUp English",
+  "short_name": "SpeakUp",
+  "description": "Englisch sprechen üben mit einer KI",
+  "lang": "de",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f6f4ff",
+  "theme_color": "#6d5dfc",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
