@@ -1,23 +1,18 @@
-// Standalone functions: the lightweight, tree-shakeable API that Mistral recommends for browsers.
-import { MistralCore } from "@mistralai/mistralai/core.js";
-import { chatComplete } from "@mistralai/mistralai/funcs/chatComplete.js";
-import { chatStream } from "@mistralai/mistralai/funcs/chatStream.js";
-import { MistralError } from "@mistralai/mistralai/models/errors";
+import Groq from "groq-sdk";
 
-// Fast model for the live conversation, stronger ones for the evaluation.
-// If a model is unavailable, the next one in the list takes over.
-const CHAT_MODELS = ["mistral-small-latest", "mistral-medium-latest"];
-const EVAL_MODELS = ["mistral-medium-latest", "mistral-large-latest", "mistral-small-latest"];
-
-// The free tier allows only a few requests per second – wait briefly and retry on 429 / 5xx.
-const RETRIES = {
-  retries: {
-    strategy: "backoff",
-    backoff: { initialInterval: 1200, maxInterval: 8000, exponent: 1.8, maxElapsedTime: 25000 },
-    retryConnectionErrors: false,
-  },
-  retryCodes: ["429", "5XX"],
-};
+// Groq's free tier limits each model separately, so every task has a list of models:
+// if one is busy, over its limit or retired, the next one takes over.
+// Fast models for the live conversation, stronger reasoning models for the evaluation.
+const CHAT_MODELS = [
+  { model: "llama-3.3-70b-versatile" },
+  { model: "openai/gpt-oss-120b", reasoning_effort: "low", include_reasoning: false },
+  { model: "llama-3.1-8b-instant" },
+];
+const EVAL_MODELS = [
+  { model: "openai/gpt-oss-120b", reasoning_effort: "medium", include_reasoning: false, jsonSchema: true },
+  { model: "llama-3.3-70b-versatile" },
+  { model: "openai/gpt-oss-20b", reasoning_effort: "medium", include_reasoning: false, jsonSchema: true },
+];
 
 export const LEVELS = {
   A2: { label: "Einsteiger", hint: "A2 · einfache Sätze, langsam" },
@@ -27,35 +22,45 @@ export const LEVELS = {
 };
 
 function client(apiKey) {
-  // The key stays on this device and is sent only to the Mistral API.
-  return new MistralCore({ apiKey });
+  // The key stays on this device and is sent only to the Groq API.
+  // No automatic retries: on errors we switch to the next model right away instead of waiting.
+  return new Groq({ apiKey, dangerouslyAllowBrowser: true, maxRetries: 0 });
 }
 
-// Standalone functions return { ok, value, error } instead of throwing.
-function unwrap(result) {
-  if (!result.ok) throw result.error;
-  return result.value;
+function canSwitchModel(err) {
+  if (err instanceof Groq.RateLimitError || err instanceof Groq.NotFoundError || err instanceof Groq.InternalServerError)
+    return true;
+  // Retired models and JSON the model failed to produce also come back as 400.
+  return err instanceof Groq.BadRequestError && /model|json/i.test(err.message);
+}
+
+// Models that just hit their limit are skipped for a while, so later turns don't wait on a failed request first.
+const coolingUntil = new Map();
+
+function coolDown(model, err) {
+  const seconds = Number(err.headers?.get("retry-after"));
+  const ms = Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds, 600) * 1000 : 60_000;
+  coolingUntil.set(model, Date.now() + ms);
 }
 
 async function withModels(models, run, canRetry = () => true) {
+  const ready = models.filter(({ model }) => (coolingUntil.get(model) ?? 0) <= Date.now());
   let lastError;
-  for (const model of models) {
+  for (const { jsonSchema, ...params } of ready.length ? ready : models) {
     try {
-      return await run(model);
+      return await run(params, jsonSchema);
     } catch (err) {
       lastError = err;
-      const next = err instanceof MistralError && (err.statusCode === 404 || err.statusCode === 429);
-      if (!next || !canRetry()) throw err;
+      if (err instanceof Groq.RateLimitError) coolDown(params.model, err);
+      if (!canSwitchModel(err) || !canRetry()) throw err;
     }
   }
   throw lastError;
 }
 
-// Message content is either a string or a list of chunks (text, thinking, …) – keep only the text.
-function textOf(content) {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) return content.map((c) => (c.type === "text" ? c.text : "")).join("");
-  return "";
+// Structured output where the model supports it, plain JSON mode (schema described in the prompt) otherwise.
+function jsonFormat(name, schema, jsonSchema) {
+  return jsonSchema ? { type: "json_schema", json_schema: { name, strict: true, schema } } : { type: "json_object" };
 }
 
 function conversationSystem(topic, level, name) {
@@ -99,17 +104,14 @@ export async function streamReply({ apiKey, topic, level, name, history, onText,
   let received = false;
   return withModels(
     CHAT_MODELS,
-    async (model) => {
-      const stream = unwrap(
-        await chatStream(
-          ai,
-          { model, messages: toMessages(conversationSystem(topic, level, name), history) },
-          { ...RETRIES, signal },
-        ),
+    async (params) => {
+      const stream = await ai.chat.completions.create(
+        { ...params, stream: true, messages: toMessages(conversationSystem(topic, level, name), history) },
+        { signal },
       );
       let text = "";
-      for await (const event of stream) {
-        const delta = textOf(event.data?.choices[0]?.delta?.content);
+      for await (const chunk of stream) {
+        const delta = chunk.choices[0]?.delta?.content;
         if (!delta) continue;
         received = true;
         text += delta;
@@ -123,38 +125,28 @@ export async function streamReply({ apiKey, topic, level, name, history, onText,
   );
 }
 
+const IDEAS_SCHEMA = {
+  type: "object",
+  properties: { ideas: { type: "array", items: { type: "string" } } },
+  required: ["ideas"],
+  additionalProperties: false,
+};
+
 export async function suggestIdeas({ apiKey, topic, level, history }) {
   const transcript = visible(history)
     .map((m) => `${m.role === "user" ? "Learner" : "Partner"}: ${m.content}`)
     .join("\n");
-  const system = `You help a German learner of English (level ${level}) who is stuck in a conversation about "${topic}". Suggest exactly 3 short, natural sentences the learner could say next, at their level. Vary them: one simple answer, one with an opinion, one question back.`;
+  const system = `You help a German learner of English (level ${level}) who is stuck in a conversation about "${topic}". Suggest exactly 3 short, natural sentences the learner could say next, at their level. Vary them: one simple answer, one with an opinion, one question back.
+Reply only with JSON like {"ideas": ["...", "...", "..."]}.`;
   const ai = client(apiKey);
-  const response = await withModels(CHAT_MODELS, async (model) =>
-    unwrap(
-      await chatComplete(
-        ai,
-        {
-          model,
-          messages: toMessages(system, [{ role: "user", content: `Conversation so far:\n${transcript || "(nothing yet)"}` }]),
-          responseFormat: {
-            type: "json_schema",
-            jsonSchema: {
-              name: "ideas",
-              strict: true,
-              schemaDefinition: {
-                type: "object",
-                properties: { ideas: { type: "array", items: { type: "string" } } },
-                required: ["ideas"],
-                additionalProperties: false,
-              },
-            },
-          },
-        },
-        RETRIES,
-      ),
-    ),
+  const response = await withModels(CHAT_MODELS, (params, jsonSchema) =>
+    ai.chat.completions.create({
+      ...params,
+      messages: toMessages(system, [{ role: "user", content: `Conversation so far:\n${transcript || "(nothing yet)"}` }]),
+      response_format: jsonFormat("ideas", IDEAS_SCHEMA, jsonSchema),
+    }),
   );
-  return parseJson(textOf(response.choices?.[0]?.message?.content)).ideas ?? [];
+  return parseJson(response.choices[0]?.message?.content).ideas ?? [];
 }
 
 const EVAL_SCHEMA = {
@@ -232,24 +224,18 @@ Feedback – write ALL feedback text in German (du-Form), warm and motivating, b
 - strengths: 2-4 concrete things done well.
 - improvements: up to 5 of the most useful corrections, each quoting the learner's original wording (English), a better native-like version (English) and a short German explanation. Prioritise repeated or typical German-speaker errors. Empty list only if there is really nothing to improve.
 - vocabulary_tips: 3-5 useful English words or phrases for this topic with German meaning.
-- next_goal: one concrete, achievable focus for the next session.`;
-  const response = await withModels(EVAL_MODELS, async (model) =>
-    unwrap(
-      await chatComplete(
-        ai,
-        {
-          model,
-          messages: toMessages(system, [{ role: "user", content: `Conversation transcript:\n\n${transcript}` }]),
-          responseFormat: {
-            type: "json_schema",
-            jsonSchema: { name: "evaluation", strict: true, schemaDefinition: EVAL_SCHEMA },
-          },
-        },
-        RETRIES,
-      ),
-    ),
+- next_goal: one concrete, achievable focus for the next session.
+
+Reply only with a JSON object that follows this JSON schema:
+${JSON.stringify(EVAL_SCHEMA)}`;
+  const response = await withModels(EVAL_MODELS, (params, jsonSchema) =>
+    ai.chat.completions.create({
+      ...params,
+      messages: toMessages(system, [{ role: "user", content: `Conversation transcript:\n\n${transcript}` }]),
+      response_format: jsonFormat("evaluation", EVAL_SCHEMA, jsonSchema),
+    }),
   );
-  const data = parseJson(textOf(response.choices?.[0]?.message?.content));
+  const data = parseJson(response.choices[0]?.message?.content);
   const clamp = (n) => Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
   for (const k of ["overall", "grammar", "vocabulary", "fluency", "coherence"]) data[k] = clamp(data[k]);
   if (!["A1", "A2", "B1", "B2", "C1", "C2"].includes(data.cefr)) data.cefr = cefrFromScore(data.overall);
@@ -267,16 +253,14 @@ function cefrFromScore(score) {
 }
 
 export function friendlyError(err) {
-  if (err?.name === "AbortError" || err?.name === "RequestAbortedError") return "Abgebrochen.";
-  if (err instanceof MistralError) {
-    if (err.statusCode === 401) return "Der API-Schlüssel ist ungültig. Bitte prüfe ihn in den Einstellungen.";
-    if (err.statusCode === 403) return "Dein API-Schlüssel darf dieses Modell nicht nutzen. Prüfe dein Konto bei Mistral.";
-    if (err.statusCode === 429)
-      return "Das kostenlose Kontingent ist gerade ausgeschöpft. Warte kurz und versuch es nochmal. Ist das Monatslimit erreicht, geht es im nächsten Monat weiter.";
-    if (err.statusCode >= 500) return "Die KI ist gerade überlastet. Bitte versuch es gleich nochmal.";
-    return `Die KI meldet einen Fehler (${err.statusCode}). Bitte versuch es erneut.`;
-  }
-  if (err?.name === "ConnectionError" || err instanceof TypeError) return "Keine Verbindung zur KI. Bist du online?";
+  if (err instanceof Groq.APIUserAbortError || err?.name === "AbortError") return "Abgebrochen.";
+  if (err instanceof Groq.AuthenticationError) return "Der API-Schlüssel ist ungültig. Bitte prüfe ihn in den Einstellungen.";
+  if (err instanceof Groq.PermissionDeniedError)
+    return "Dein API-Schlüssel darf dieses Modell nicht nutzen. Prüfe dein Konto bei Groq.";
+  if (err instanceof Groq.RateLimitError)
+    return "Das kostenlose Kontingent ist gerade ausgeschöpft. Warte eine Minute und versuch es nochmal. Ist das Tageslimit erreicht, geht es morgen weiter.";
+  if (err instanceof Groq.APIConnectionError) return "Keine Verbindung zur KI. Bist du online?";
+  if (err instanceof Groq.APIError) return `Die KI meldet einen Fehler (${err.status ?? "?"}). Bitte versuch es erneut.`;
   if (err instanceof SyntaxError) return "Die Antwort der KI war unvollständig. Bitte versuch es nochmal.";
   return err?.message || "Unbekannter Fehler.";
 }
